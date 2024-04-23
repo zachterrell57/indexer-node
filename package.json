@@ -1,0 +1,38 @@
+{
+  "name": "indexer-node",
+  "version": "1.0.0",
+  "main": "./dist/app.js",
+  "module": "./dist/app.mjs",
+  "types": "./dist/app.d.ts",
+  "exports": {
+    ".": {
+      "require": "./dist/app.js",
+      "import": "./dist/app.mjs",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup --config tsup.config.ts",
+    "start": "tsx ./src/app.ts"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@farcaster/shuttle": "^0.2.3",
+    "bullmq": "^5.7.4",
+    "dotenv": "^16.4.5",
+    "neverthrow": "^6.2.1",
+    "pino": "^8.20.0",
+    "pino-pretty": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "tsup": "^8.0.2",
+    "tsx": "^4.7.2",
+    "typescript": "^5.4.5"
+  }
+}
