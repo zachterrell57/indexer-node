@@ -3,94 +3,199 @@ import {
   getHubClient,
   EventStreamConnection,
   EventStreamHubSubscriber,
+  type MessageHandler,
+  type DB,
+  HubSubscriber,
+  HubEventProcessor,
+  HubEventStreamConsumer,
+  MessageReconciliation,
+  getDbClient,
 } from "@farcaster/shuttle";
-import { Queue } from "bullmq";
-import { HUB_HOST, HUB_SSL, REDIS_URL } from "./env";
+import { bytesToHexString, HubEvent } from "@farcaster/hub-nodejs";
+import {
+  BACKFILL_FIDS,
+  CONCURRENCY,
+  HUB_HOST,
+  HUB_SSL,
+  MAX_FID,
+  POSTGRES_URL,
+  REDIS_URL,
+} from "./env";
 import { log } from "./log";
-import { getWorker } from "./worker";
+import { ok } from "neverthrow";
+import { getQueue, getWorker } from "./worker";
+import { ensureMigrations } from "./db";
 
 const hubId = "shuttle";
 
-const hub = getHubClient(HUB_HOST, { ssl: HUB_SSL });
-const redis = RedisClient.create(REDIS_URL);
-const eventStreamForWrite = new EventStreamConnection(redis.client);
-const hubSubscriber = new EventStreamHubSubscriber(
-  hubId,
-  hub,
-  eventStreamForWrite,
-  redis,
-  "all",
-  log
-);
+export class App implements MessageHandler {
+  private hubSubscriber: HubSubscriber;
+  private streamConsumer: HubEventStreamConsumer;
+  public readonly db: DB;
+  public redis: RedisClient;
+  private readonly hubId;
 
-log.info(`Connected to ${hub.host}`);
-
-log.info(`Backfilling fids...`);
-backfillFids();
-
-log.info(`Starting worker...`);
-const worker = getWorker(hub, redis, log);
-await worker.run();
-
-async function backfillFids() {
-  const startedAt = Date.now();
-
-  const backfillQueue = new Queue("default", {
-    connection: redis.client,
-    defaultJobOptions: {
-      attempts: 3,
-      backoff: { delay: 1000, type: "exponential" },
-    },
-  });
-
-  if (!hubSubscriber.hubClient) {
-    log.error("Hub client is not initialized");
-    throw new Error("Hub client is not initialized");
+  constructor(
+    db: DB,
+    redis: RedisClient,
+    hubSubscriber: HubSubscriber,
+    streamConsumer: HubEventStreamConsumer
+  ) {
+    this.db = db;
+    this.redis = redis;
+    this.hubSubscriber = hubSubscriber;
+    this.hubId = hubId;
+    this.streamConsumer = streamConsumer;
   }
 
-  const maxFidResult = await hubSubscriber.hubClient.getFids({
-    pageSize: 1,
-    reverse: true,
-  });
+  static create(
+    dbUrl: string,
+    redisUrl: string,
+    hubUrl: string,
+    hubSSL = false
+  ) {
+    const db = getDbClient(dbUrl);
+    const hub = getHubClient(hubUrl, { ssl: hubSSL });
+    const redis = RedisClient.create(redisUrl);
+    const eventStreamForWrite = new EventStreamConnection(redis.client);
+    const eventStreamForRead = new EventStreamConnection(redis.client);
+    const hubSubscriber = new EventStreamHubSubscriber(
+      hubId,
+      hub,
+      eventStreamForWrite,
+      redis,
+      "all",
+      log
+    );
+    const streamConsumer = new HubEventStreamConsumer(
+      hub,
+      eventStreamForRead,
+      "all"
+    );
 
-  if (maxFidResult.isErr()) {
-    log.error("Failed to get max fid", maxFidResult.error);
-    throw maxFidResult.error;
+    return new App(db, redis, hubSubscriber, streamConsumer);
   }
 
-  const maxFid = maxFidResult?.value.fids[0];
+  async stream() {
+    // Hub subscriber listens to events from the hub and writes them to a redis stream. This allows for scaling by
+    // splitting events to multiple streams
+    await this.hubSubscriber.start();
 
-  if (!maxFid) {
-    log.error("Max fid was undefined");
-    throw new Error("Max fid was undefined");
+    // Sleep 10 seconds to give the subscriber a chance to create the stream for the first time.
+    await new Promise((resolve) => setTimeout(resolve, 10_000));
+
+    log.info("Starting stream consumer");
+    // Stream consumer reads from the redis stream and inserts them into postgres
+    await this.streamConsumer.start(async (hubEvent) => {
+      await HubEventProcessor.processHubEvent(this.db, hubEvent, this);
+      return ok({ skipped: false });
+    });
   }
 
-  log.info(`Queuing up fids up to: ${maxFid}`);
+  async backfill() {
+    const fids = BACKFILL_FIDS
+      ? BACKFILL_FIDS.split(",").map((fid) => parseInt(fid))
+      : [];
 
-  // create an array of arrays in batches of 10 upto maxFid
-  const batchSize = 10;
-  const fids = Array.from(
-    { length: Math.ceil(maxFid / batchSize) },
-    (_, i) => i * batchSize
-  ).map((fid) => fid + 1);
-  for (const start of fids) {
-    const subset = Array.from({ length: batchSize }, (_, i) => start + i);
-    await backfillQueue.add("reconcile", { fids: subset });
+    const backfillQueue = getQueue(this.redis.client);
+
+    const startedAt = Date.now();
+    if (fids.length === 0) {
+      const maxFidResult = await this.hubSubscriber.hubClient!.getFids({
+        pageSize: 1,
+        reverse: true,
+      });
+      if (maxFidResult.isErr()) {
+        log.error("Failed to get max fid", maxFidResult.error);
+        throw maxFidResult.error;
+      }
+      const maxFid = MAX_FID ? parseInt(MAX_FID) : maxFidResult.value.fids[0];
+      if (!maxFid) {
+        log.error("Max fid was undefined");
+        throw new Error("Max fid was undefined");
+      }
+      log.info(`Queuing up fids up to: ${maxFid}`);
+      // create an array of arrays in batches of 100 up to maxFid
+      const batchSize = 10;
+      const fids = Array.from(
+        { length: Math.ceil(maxFid / batchSize) },
+        (_, i) => i * batchSize
+      ).map((fid) => fid + 1);
+      for (const start of fids) {
+        const subset = Array.from({ length: batchSize }, (_, i) => start + i);
+        await backfillQueue.add("reconcile", { fids: subset });
+      }
+    } else {
+      await backfillQueue.add("reconcile", { fids });
+    }
+
+    await backfillQueue.add("completionMarker", { startedAt });
+    log.info("Backfill jobs queued");
+
+    log.info(`Starting worker...`);
+    const worker = getWorker(this, app.redis.client, log, CONCURRENCY);
+    await worker.run();
   }
 
-  await backfillQueue.add("completionMarker", { startedAt });
-  log.info("Backfill jobs queued");
+  async handleMessageMerge(): Promise<void> {}
+
+  async reconcileFids(fids: number[]) {
+    // biome-ignore lint/style/noNonNullAssertion: client is always initialized
+    const reconciler = new MessageReconciliation(
+      this.hubSubscriber.hubClient!,
+      this.db,
+      log
+    );
+    for (const fid of fids) {
+      await reconciler.reconcileMessagesForFid(
+        fid,
+        async (message, missingInDb, prunedInDb, revokedInDb) => {
+          if (missingInDb) {
+            await HubEventProcessor.handleMissingMessage(
+              this.db,
+              message,
+              this
+            );
+          } else if (prunedInDb || revokedInDb) {
+            const messageDesc = prunedInDb
+              ? "pruned"
+              : revokedInDb
+              ? "revoked"
+              : "existing";
+            log.info(
+              `Reconciled ${messageDesc} message ${bytesToHexString(
+                message.hash
+              )._unsafeUnwrap()}`
+            );
+          }
+        }
+      );
+    }
+  }
+
+  async stop() {
+    this.hubSubscriber.stop();
+    const lastEventId = await this.redis.getLastProcessedEvent(this.hubId);
+    log.info(`Stopped at eventId: ${lastEventId}`);
+  }
 }
 
-// console.log(`Starting stream...`);
-// await this.hubSubscriber.start();
+const app = App.create(POSTGRES_URL, REDIS_URL, HUB_HOST, HUB_SSL);
 
-// // TODO: There has to be a better way to do this
-// // Sleep 10 seconds to give the subscriber a chance to create the stream for the first time.
-// await new Promise((resolve) => setTimeout(resolve, 10_000));
+ensureMigrations(app.db, log);
 
-// // Stream consumer reads from the redis stream and inserts them into postgres
-// await this.streamConsumer.start(async (event) => {
-//   HubEventProcessor.processHubEvent(this.db, event, this);
-//   return ok({ skipped: false });
-// });
+app.backfill();
+// app.stream();
+
+// for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+//   process.on(signal, async () => {
+//     log.info(`Received ${signal}. Shutting down...`);
+//     (async () => {
+//       await sleep(10_000);
+//       log.info(`Shutdown took longer than 10s to complete. Forcibly terminating.`);
+//       process.exit(1);
+//     })();
+//     await app?.stop();
+//     process.exit(1);
+//   });
+// }

@@ -1,31 +1,13 @@
 import { Redis } from "ioredis";
 import { Job, Queue, Worker } from "bullmq";
+import { App } from "./app";
 import { pino } from "pino";
-import {
-  MessageReconciliation,
-  type HubClient,
-  RedisClient,
-  HubEventProcessor,
-  type MessageHandler,
-} from "@farcaster/shuttle";
-import { bytesToHexString } from "@farcaster/hub-nodejs";
 
 const QUEUE_NAME = "default";
 
-export function getQueue(redis: Redis) {
-  return new Queue("default", {
-    connection: redis,
-    defaultJobOptions: {
-      attempts: 3,
-      backoff: { delay: 1000, type: "exponential" },
-    },
-  });
-}
-
 export function getWorker(
-  hub: HubClient,
-  handler: MessageHandler,
-  redis: RedisClient,
+  app: App,
+  redis: Redis,
   log: pino.Logger,
   concurrency = 1
 ) {
@@ -35,9 +17,7 @@ export function getWorker(
       if (job.name === "reconcile") {
         const start = Date.now();
         const fids = job.data.fids as number[];
-
-        await reconcileFids(fids, hub, db, log);
-
+        await app.reconcileFids(fids);
         const elapsed = (Date.now() - start) / 1000;
         const lastFid = fids[fids.length - 1];
         log.info(
@@ -67,33 +47,12 @@ export function getWorker(
   return worker;
 }
 
-async function reconcileFids(
-  fids: number[],
-  hub: HubClient,
-  handler: MessageHandler,
-  db: PrismaClient,
-  log: pino.Logger
-) {
-  const reconciler = new MessageReconciliation(hub.client, db, log);
-  for (const fid of fids) {
-    await reconciler.reconcileMessagesForFid(
-      fid,
-      async (message, missingInDb, prunedInDb, revokedInDb) => {
-        if (missingInDb) {
-          await HubEventProcessor.handleMissingMessage(db, message, handler);
-        } else if (prunedInDb || revokedInDb) {
-          const messageDesc = prunedInDb
-            ? "pruned"
-            : revokedInDb
-            ? "revoked"
-            : "existing";
-          log.info(
-            `Reconciled ${messageDesc} message ${bytesToHexString(
-              message.hash
-            )._unsafeUnwrap()}`
-          );
-        }
-      }
-    );
-  }
+export function getQueue(redis: Redis) {
+  return new Queue("default", {
+    connection: redis,
+    defaultJobOptions: {
+      attempts: 3,
+      backoff: { delay: 1000, type: "exponential" },
+    },
+  });
 }

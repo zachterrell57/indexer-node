@@ -11,6 +11,9 @@
       "types": "./dist/index.d.ts"
     }
   },
+  "engines": {
+    "node": ">=21"
+  },
   "files": [
     "dist"
   ],
@@ -25,12 +28,15 @@
     "@farcaster/shuttle": "^0.2.3",
     "bullmq": "^5.7.4",
     "dotenv": "^16.4.5",
+    "kysely": "^0.27.3",
     "neverthrow": "^6.2.1",
     "pino": "^8.20.0",
     "pino-pretty": "^11.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.12.7",
+    "@types/pg": "^8.10.3",
+    "@types/pg-cursor": "^2.7.0",
     "tsup": "^8.0.2",
     "tsx": "^4.7.2",
     "typescript": "^5.4.5"
